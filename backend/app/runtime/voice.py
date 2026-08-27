@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
+import sys
 import time
 from typing import Any
 
@@ -41,9 +43,21 @@ class VoiceRuntime:
         self.last_transcript: str | None = None
         self.last_audio_file: str | None = None
 
+    def tts_configured(self) -> bool:
+        """Spoken replies need both a key and a voice id; captions run without them."""
+        return bool(self.settings.elevenlabs_api_key and self.settings.elevenlabs_tts_voice_id)
+
+    def active_tts_engine(self) -> str:
+        """Which engine will actually speak: ElevenLabs, the local voice, or nothing."""
+        if self.tts_configured():
+            return "elevenlabs"
+        return "local" if sys.platform == "darwin" else "none"
+
     def health(self) -> dict[str, Any]:
         return {
             "elevenlabs_configured": bool(self.settings.elevenlabs_api_key),
+            "tts_configured": self.tts_configured(),
+            "tts_engine": self.active_tts_engine(),
             "stt_model": self.settings.elevenlabs_stt_model,
             "tts_model": self.settings.elevenlabs_tts_model,
             "voice_id": self.settings.elevenlabs_tts_voice_id,
@@ -108,13 +122,46 @@ class VoiceRuntime:
         return " ".join(text.split())
 
     def synthesize_audio(self, session_id: str, voice_event_id: str, text: str) -> str | None:
-        if not self.settings.elevenlabs_api_key:
-            self.last_error = "ElevenLabs TTS unavailable: ELEVENLABS_API_KEY is missing"
-            raise RuntimeError(self.last_error)
-        if not self.settings.elevenlabs_tts_voice_id:
-            self.last_error = "ElevenLabs TTS unavailable: ELEVENLABS_TTS_VOICE_ID is missing"
-            raise RuntimeError(self.last_error)
+        """Speak via ElevenLabs when configured, otherwise fall back to local system TTS."""
+        if self.tts_configured():
+            try:
+                return self._synthesize_elevenlabs(session_id, voice_event_id, text)
+            except Exception as exc:
+                logger.warning("ElevenLabs TTS failed (%s); using local voice", exc)
 
+        audio_url = self._synthesize_local(session_id, voice_event_id, text)
+        if audio_url is None:
+            self.last_error = "TTS unavailable: no ElevenLabs credentials and no local voice"
+            raise RuntimeError(self.last_error)
+        return audio_url
+
+    def _synthesize_local(self, session_id: str, voice_event_id: str, text: str) -> str | None:
+        """Offline TTS using the macOS `say` binary. Returns None where unavailable."""
+        if sys.platform != "darwin":
+            return None
+
+        safe_event_id = voice_event_id.replace(":", "_")
+        file_name = f"{session_id}_{safe_event_id}_{int(time.time() * 1000)}.m4a"
+        file_path = self.audio_dir / file_name
+        try:
+            subprocess.run(
+                ["say", "-o", str(file_path), text],
+                check=True,
+                capture_output=True,
+                timeout=20,
+            )
+        except Exception as exc:
+            logger.warning("Local TTS failed: %s", exc)
+            return None
+
+        if not file_path.exists() or file_path.stat().st_size == 0:
+            return None
+
+        self.last_audio_file = file_name
+        self.last_error = None
+        return f"/artifacts/audio/{file_name}"
+
+    def _synthesize_elevenlabs(self, session_id: str, voice_event_id: str, text: str) -> str | None:
         response = requests.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{self.settings.elevenlabs_tts_voice_id}",
             headers={

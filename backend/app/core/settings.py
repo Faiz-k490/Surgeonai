@@ -42,6 +42,7 @@ class Settings:
     response_dedupe_seconds: float
     snapshot_bucket: str
     snapshot_size: int
+    scripted_flow: bool
     repo_root: Path
     backend_root: Path
 
@@ -90,6 +91,7 @@ def load_settings() -> Settings:
         major_scene_cooldown_seconds=float(os.getenv("MAJOR_SCENE_COOLDOWN_SECONDS", "2.5")),
         response_dedupe_seconds=float(os.getenv("RESPONSE_DEDUPE_SECONDS", "8.0")),
         snapshot_bucket=os.getenv("SNAPSHOT_BUCKET", "surgeai-snapshots"),
+        scripted_flow=os.getenv("SCRIPTED_FLOW", "true").strip().lower() not in ("0", "false", "no"),
         snapshot_size=int(os.getenv("SNAPSHOT_SIZE", "512")),
         repo_root=REPO_ROOT,
         backend_root=BACKEND_ROOT,

@@ -2,6 +2,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { useState } from 'react';
 import { useHudStore } from './store/useHudStore';
 import SocketManager from './providers/SocketManager';
+import { useSessionControls } from './providers/SessionControlsContext';
 import VideoBackground from './components/VideoBackground';
 import SystemHealth from './components/SystemHealth';
 import AROverlay from './components/AROverlay';
@@ -209,6 +210,67 @@ function GuidanceRibbon() {
   );
 }
 
+// eslint-disable-next-line react/prop-types
+function DemoControls({ onReturnToLanding }) {
+  const { restartSession, stopSession } = useSessionControls();
+  const [activeAction, setActiveAction] = useState(null);
+  const [controlError, setControlError] = useState(null);
+
+  const handleRestart = async () => {
+    setActiveAction('restart');
+    setControlError(null);
+    try {
+      await restartSession();
+    } catch (error) {
+      setControlError(error?.message || 'Could not restart the demo.');
+    } finally {
+      setActiveAction(null);
+    }
+  };
+
+  const handleReturnToLanding = async () => {
+    setActiveAction('landing');
+    setControlError(null);
+    try {
+      await stopSession();
+      onReturnToLanding();
+    } catch (error) {
+      setControlError(error?.message || 'Could not stop the demo.');
+      setActiveAction(null);
+    }
+  };
+
+  const busy = activeAction !== null;
+
+  return (
+    <div className="absolute right-5 top-5 z-[90] flex flex-col items-end gap-2">
+      <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-black/65 p-2 shadow-2xl backdrop-blur-xl">
+        <button
+          type="button"
+          onClick={handleRestart}
+          disabled={busy}
+          className="rounded-xl border border-cyan-400/25 bg-cyan-400/10 px-4 py-2 text-[11px] font-bold uppercase tracking-[0.16em] text-cyan-200 transition hover:border-cyan-300/60 hover:bg-cyan-400/20 disabled:cursor-wait disabled:opacity-50"
+        >
+          {activeAction === 'restart' ? 'Restarting…' : '↻ Restart Session'}
+        </button>
+        <button
+          type="button"
+          onClick={handleReturnToLanding}
+          disabled={busy}
+          className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-[11px] font-bold uppercase tracking-[0.16em] text-white/75 transition hover:border-white/35 hover:bg-white/10 hover:text-white disabled:cursor-wait disabled:opacity-50"
+        >
+          {activeAction === 'landing' ? 'Stopping…' : '⌂ Landing Page'}
+        </button>
+      </div>
+      {controlError ? (
+        <p className="max-w-sm rounded-lg border border-red-400/25 bg-red-950/80 px-3 py-2 text-xs text-red-200">
+          {controlError}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 
 // ── App ────────────────────────────────────────────────────────────────────
 function App() {
@@ -269,6 +331,13 @@ function App() {
                   {/* Z-45: Guidance Ribbon */}
                   <GuidanceRibbon />
 
+                  {/* Z-90: Demo recovery controls */}
+                  <DemoControls onReturnToLanding={() => {
+                    setBooted(false);
+                    setShowLanding(true);
+                    window.scrollTo({ top: 0, behavior: 'auto' });
+                  }} />
+
                   {/* Z-50: Surgery Complete */}
                   <SurgeryComplete />
 
@@ -285,4 +354,3 @@ function App() {
 }
 
 export default App;
-

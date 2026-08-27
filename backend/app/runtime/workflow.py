@@ -42,6 +42,15 @@ SURGICAL_STEPS = {
     "complete",
 }
 
+# Wake-word driven demo script. Each "hey surgeon" advances one line; the step
+# after the last one ends the session with the completion message.
+SCRIPTED_NOT_READY = "Show the clamp on the left and the scalpel on the right."
+SCRIPTED_MAX_BLOCKED_WAKES = 3
+SCRIPTED_SEQUENCE = [
+    ("make_incision", "Tools locked. Position the scalpel along the red line and make your incision."),
+    ("use_clamp", "Good. Now use the clamp to lift the incision flap away from the cut."),
+]
+
 
 @dataclass
 class WorkflowContext:
@@ -58,6 +67,8 @@ class ConversationOrchestrator:
         self.phase = 0
         self.runtime_state = RUNTIME_STATES[0]
         self.surgical_step = "scene_setup"
+        self.scripted_flow = settings.scripted_flow
+        self.blocked_wake_count = 0
         self.session_id: str | None = None
         self.phase_started_at = 0.0
         self.voice_counter = 0
@@ -236,7 +247,14 @@ class ConversationOrchestrator:
         if not self.warning and self.runtime_state == RUNTIME_STATES[1]:
             self.runtime_state = RUNTIME_STATES[2]
 
-        if self.phase != 0 and self.surgical_step != "complete" and not self.session_terminated:
+        # In scripted mode the wake word owns the step; recomputing it from
+        # geometry every frame would undo each advance.
+        if (
+            not self.scripted_flow
+            and self.phase != 0
+            and self.surgical_step != "complete"
+            and not self.session_terminated
+        ):
             self.surgical_step = self._suggest_step(context, now, self.surgical_step)
 
     def maybe_finalize_completion(self, context: WorkflowContext, snapshot_service: SnapshotService) -> None:
@@ -305,6 +323,43 @@ class ConversationOrchestrator:
         self.voice_counter += 1
         self.pending_voice = {"id": f"{self.session_id}:{self.voice_counter}", "message": message}
         logger.info("Voice event %s: %s", self.pending_voice["id"], message)
+
+    def tools_are_ready(self) -> bool:
+        return "tools_ready" in self.scene_events or (
+            "clamp_locked" in self.scene_events and "scalpel_locked" in self.scene_events
+        )
+
+    def scripted_advance(self) -> dict[str, Any] | None:
+        """One wake-phrase step. Returns None when the next move is to finish."""
+        if self.surgical_step == "scene_setup":
+            if self.tools_are_ready():
+                self.blocked_wake_count = 0
+                return self._scripted_result(*SCRIPTED_SEQUENCE[0])
+            # Never let shaky detection strand a live demo: after a few asks,
+            # move on anyway rather than repeating the same line forever.
+            self.blocked_wake_count += 1
+            if self.blocked_wake_count < SCRIPTED_MAX_BLOCKED_WAKES:
+                return self._scripted_result("scene_setup", SCRIPTED_NOT_READY)
+            logger.warning(
+                "Tools never detected after %s wake phrases; advancing anyway",
+                self.blocked_wake_count,
+            )
+            self.blocked_wake_count = 0
+            return self._scripted_result(*SCRIPTED_SEQUENCE[0])
+        if self.surgical_step in ("position_scalpel", "make_incision"):
+            return self._scripted_result(*SCRIPTED_SEQUENCE[1])
+        return None
+
+    def _scripted_result(self, step: str, text: str) -> dict[str, Any]:
+        return {
+            "current_state": step,
+            "step_complete": False,
+            "next_instruction": text,
+            "speak_text": text,
+            "ui_hint": text,
+            "confidence": 1.0,
+            "should_advance_step": False,
+        }
 
     def _advance_step(self, step: str) -> str:
         ordered = ["scene_setup", "position_scalpel", "make_incision", "use_clamp", "complete"]

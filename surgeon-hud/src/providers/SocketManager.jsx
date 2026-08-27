@@ -4,6 +4,7 @@ import { io } from 'socket.io-client';
 import { getApiBase, getSocketUrl } from '../config';
 import { log } from '../lib/logger';
 import { useHudStore } from '../store/useHudStore';
+import { SessionControlsContext } from './SessionControlsContext';
 
 function unwrap(data) {
   return data?.payload ?? data;
@@ -42,6 +43,7 @@ export default function SocketManager({ children }) {
   const lastWakeAtRef = useRef(0);
   const lastQueryAtRef = useRef(0);
   const playbackAudioRef = useRef(null);
+  const audioStartedRef = useRef(false);
   const lastPlayedVoiceIdRef = useRef(null);
 
   const stopRecognition = useCallback(() => {
@@ -198,6 +200,41 @@ export default function SocketManager({ children }) {
     }
   }, [setClientVoiceState, setListeningState, setMicPermission, setTranscriptPreview]);
 
+  const silenceClientMedia = useCallback(() => {
+    activeCommandRef.current = false;
+    stopRecognition();
+    if (playbackAudioRef.current) {
+      playbackAudioRef.current.pause();
+      playbackAudioRef.current.currentTime = 0;
+      playbackAudioRef.current = null;
+    }
+    audioStartedRef.current = false;
+    lastPlayedVoiceIdRef.current = null;
+    window.speechSynthesis?.cancel?.();
+    setListeningState('idle');
+    setClientVoiceState('passive');
+  }, [setClientVoiceState, setListeningState, stopRecognition]);
+
+  const restartSession = useCallback(async () => {
+    silenceClientMedia();
+    const response = await fetch(`${getApiBase()}/session/restart`, { method: 'POST' });
+    if (!response.ok) {
+      throw new Error(`Restart failed (${response.status})`);
+    }
+    const result = await response.json();
+    startRecognition();
+    return result;
+  }, [silenceClientMedia, startRecognition]);
+
+  const stopSession = useCallback(async () => {
+    silenceClientMedia();
+    const response = await fetch(`${getApiBase()}/session/stop`, { method: 'POST' });
+    if (!response.ok) {
+      throw new Error(`Stop failed (${response.status})`);
+    }
+    return response.json();
+  }, [silenceClientMedia]);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -251,6 +288,7 @@ export default function SocketManager({ children }) {
             const payload = unwrap(raw);
             const voiceEventId = payload?.voice_event_id;
             const audioBase64 = payload?.audio_base64;
+            const audioMime = payload?.audio_mime || 'audio/mpeg';
             const rawAudioUrl = payload?.audio_url;
             const voicePrompt = payload?.voice_prompt;
             if (!voiceEventId || voiceEventId === lastPlayedVoiceIdRef.current) return;
@@ -265,7 +303,7 @@ export default function SocketManager({ children }) {
               }
 
               const audioSrc = audioBase64
-                ? `data:audio/mpeg;base64,${audioBase64}`
+                ? `data:${audioMime};base64,${audioBase64}`
                 : rawAudioUrl
                   ? `${getApiBase()}${rawAudioUrl}`
                   : null;
@@ -274,8 +312,13 @@ export default function SocketManager({ children }) {
                 throw new Error('No TTS audio payload returned');
               }
 
+              window.speechSynthesis?.cancel?.();
               const audio = new Audio(audioSrc);
               playbackAudioRef.current = audio;
+              audioStartedRef.current = false;
+              audio.onplaying = () => {
+                audioStartedRef.current = true;
+              };
           audio.onended = () => {
                 socket.emit('voice_playback_complete');
                 if (useHudStore.getState().sessionTerminated) {
@@ -287,8 +330,13 @@ export default function SocketManager({ children }) {
               };
               await audio.play();
             } catch (error) {
-              log.warn(`Audio playback failed, using browser TTS fallback: ${error?.message || error}`);
-              speakFallback(voicePrompt);
+              if (audioStartedRef.current) {
+                // Audio is already speaking; a second voice here would overlap it.
+                log.warn(`Audio error after playback started, skipping fallback: ${error?.message || error}`);
+              } else {
+                log.warn(`Audio playback failed, using browser TTS fallback: ${error?.message || error}`);
+                speakFallback(voicePrompt);
+              }
               socket.emit('voice_playback_complete');
               if (useHudStore.getState().sessionTerminated) {
                 setClientVoiceState('complete');
@@ -336,5 +384,9 @@ export default function SocketManager({ children }) {
     consumeActivationRequest();
   }, [activationRequested, consumeActivationRequest]);
 
-  return <>{children}</>;
+  return (
+    <SessionControlsContext.Provider value={{ restartSession, stopSession }}>
+      {children}
+    </SessionControlsContext.Provider>
+  );
 }

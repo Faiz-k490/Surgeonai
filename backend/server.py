@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import base64
 import copy
+import json
 import logging
+import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -43,6 +46,35 @@ socketio = SocketIO(
     logger=True,
     engineio_logger=True,
 )
+
+
+def preferred_capture_backend() -> int:
+    """OpenCV capture backend for the host OS (DirectShow is Windows-only)."""
+    if sys.platform == "darwin":
+        return cv2.CAP_AVFOUNDATION
+    if sys.platform == "win32":
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
+
+
+def macos_camera_names() -> list[str]:
+    """Attached camera names, for diagnostics only.
+
+    system_profiler's ordering is not stable between runs and does not reliably
+    map to AVFoundation capture indexes, so this must not be used to pick a device.
+    """
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPCameraDataType", "-json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        devices = json.loads(result.stdout).get("SPCameraDataType", [])
+    except Exception as exc:
+        logger.warning("[CAMERA] Could not enumerate macOS cameras: %s", exc)
+        return []
+    return [str(device.get("_name", "unknown")) for device in devices]
 
 
 class RuntimeController:
@@ -138,6 +170,24 @@ class RuntimeController:
         self.broadcast_state(payload)
         return payload
 
+    def stop_session(self) -> dict[str, Any]:
+        """Stop demo work and return the runtime to its zero-cost idle state."""
+        with self.runtime_lock:
+            previous_session = self.workflow.session_id
+            self._stop_threads_locked()
+            if previous_session:
+                self.snapshot_service.reset_session(previous_session)
+
+            with self.state_lock:
+                self.vision.reset()
+                self.workflow.reset()
+                self.metrics = {"fps": 0.0, "latency": 0, "camera_locked": False}
+
+        payload = self.current_state_payload()
+        self.broadcast_state(payload)
+        logger.info("SurgeAI session stopped; camera and inference resources released")
+        return payload
+
     def broadcast_state(self, payload: dict[str, Any] | None = None) -> None:
         payload = payload or self.current_state_payload()
         socketio.emit("frame_state", {"payload": payload}, namespace=settings.namespace)
@@ -182,6 +232,9 @@ class RuntimeController:
         self.broadcast_state(payload)
         if self.voice_runtime.is_completion_intent(clean_text):
             self._handle_terminal_completion(trigger_reason=trigger_kind)
+            return
+        if settings.scripted_flow:
+            self._run_scripted_turn(trigger_reason=trigger_kind)
             return
         self._run_vlm_turn(user_transcript=clean_text, trigger_reason=trigger_kind)
 
@@ -250,7 +303,30 @@ class RuntimeController:
         self._run_vlm_turn(user_transcript=effective_transcript, trigger_reason=f"{trigger_kind}_voice")
 
     def handle_scene_trigger(self, trigger_reason: str) -> None:
+        # The wake word owns pacing in scripted mode; unprompted speech would
+        # step on the demo.
+        if settings.scripted_flow:
+            return
         self._run_vlm_turn(user_transcript=None, trigger_reason=trigger_reason)
+
+    def _run_scripted_turn(self, *, trigger_reason: str) -> None:
+        with self.state_lock:
+            result = self.workflow.scripted_advance()
+        if result is None:
+            self._handle_terminal_completion(trigger_reason=trigger_reason)
+            return
+
+        with self.state_lock:
+            audio_url = self._synthesize_if_possible(result, trigger_reason)
+            emitted = self.workflow.apply_assistant_result(
+                result, audio_url=audio_url, source="scripted"
+            )
+            payload = self.workflow.build_payload(
+                self._context_snapshot(), self.snapshot_service, self._services_payload()
+            )
+        self.broadcast_state(payload)
+        if emitted and audio_url:
+            self._emit_tts_ready(audio_url, payload)
 
     def _run_vlm_turn(self, *, user_transcript: str | None, trigger_reason: str | None) -> None:
         with self.state_lock:
@@ -276,6 +352,9 @@ class RuntimeController:
         if crop_jpeg is None:
             crop_jpeg, _ = self.snapshot_service.latest_crop_jpeg(session_id)
         if crop_jpeg is None:
+            with self.state_lock:
+                if self.workflow.session_id != session_id:
+                    return
             self._set_degraded("ROI capture is unavailable.", "Move the banana back into view.")
             return
 
@@ -289,16 +368,30 @@ class RuntimeController:
                 trigger_reason=trigger_reason,
             )
         except Exception as exc:
-            logger.warning("VLM request failed: %s", exc)
+            # No API key is a deliberate offline configuration, not a fault: run the
+            # scripted guidance as normal operation and keep the warning banner clear.
+            scripted_mode = self.vlm_runtime.client is None
+            if scripted_mode:
+                logger.debug("VLM not configured; using scripted guidance")
+            else:
+                logger.warning("VLM request failed: %s", exc)
+
             result = self._fallback_response(user_transcript, scene_events, surgical_step)
             with self.state_lock:
+                if self.workflow.session_id != session_id:
+                    return
                 audio_url = self._synthesize_if_possible(result, trigger_reason or "fallback")
-                self.workflow.apply_degraded_response(
-                    "Vision reasoning is degraded.",
-                    result["next_instruction"],
+                if not scripted_mode:
+                    self.workflow.apply_degraded_response(
+                        "Vision reasoning is degraded.",
+                        result["next_instruction"],
+                        audio_url=audio_url,
+                    )
+                emitted = self.workflow.apply_assistant_result(
+                    result,
                     audio_url=audio_url,
+                    source="scripted" if scripted_mode else "fallback",
                 )
-                emitted = self.workflow.apply_assistant_result(result, audio_url=audio_url, source="fallback")
                 payload = self.workflow.build_payload(self._context_snapshot(), self.snapshot_service, self._services_payload())
             self.broadcast_state(payload)
             if emitted and audio_url:
@@ -306,6 +399,8 @@ class RuntimeController:
             return
 
         with self.state_lock:
+            if self.workflow.session_id != session_id:
+                return
             audio_url = self._synthesize_if_possible(result, trigger_reason or "vlm")
             emitted = self.workflow.apply_assistant_result(result, audio_url=audio_url, source=trigger_reason or "vlm")
             payload = self.workflow.build_payload(self._context_snapshot(), self.snapshot_service, self._services_payload())
@@ -315,6 +410,9 @@ class RuntimeController:
 
     def _emit_tts_ready(self, audio_url: str, payload: dict[str, Any]) -> None:
         audio_base64 = None
+        # ElevenLabs returns mp3, the local `say` fallback returns m4a; the client
+        # needs the right mime to build a playable data URI.
+        audio_mime = "audio/mp4" if audio_url.endswith(".m4a") else "audio/mpeg"
         if audio_url.startswith("/artifacts/audio/"):
             file_name = audio_url.split("/artifacts/audio/", 1)[1]
             audio_path = settings.backend_root / "artifacts" / "audio" / file_name
@@ -326,6 +424,7 @@ class RuntimeController:
                 "payload": {
                     "audio_url": audio_url,
                     "audio_base64": audio_base64,
+                    "audio_mime": audio_mime,
                     "voice_prompt": payload.get("voice_prompt"),
                     "voice_event_id": payload.get("voice_event_id"),
                 }
@@ -356,7 +455,10 @@ class RuntimeController:
                 speak_text,
             )
         except Exception as exc:
-            logger.warning("TTS synthesis failed: %s", exc)
+            if self.voice_runtime.tts_configured():
+                logger.warning("TTS synthesis failed: %s", exc)
+            else:
+                logger.debug("TTS not configured; running captions only")
             return None
 
     def _synthesize_terminal_message(self, trigger_label: str) -> str | None:
@@ -509,27 +611,53 @@ class RuntimeController:
                 time.sleep(remaining)
 
     def _open_camera(self):
-        logger.info("[CAMERA] Locking to %s at index %s", settings.camera_label, settings.camera_index)
-        capture = cv2.VideoCapture(settings.camera_index, cv2.CAP_DSHOW)
-        if not capture.isOpened():
-            raise RuntimeError(
-                f"[FATAL] {settings.camera_label} was not found at index {settings.camera_index}. "
-                "SurgeAI will not fall back to any other camera."
-            )
+        backend = preferred_capture_backend()
 
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, settings.frame_width)
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, settings.frame_height)
-        capture.set(cv2.CAP_PROP_FPS, settings.target_fps)
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Try the configured index first, then sweep the low indexes. Device order
+        # is not stable across replugs, so the only reliable test is opening one
+        # and seeing whether frames actually arrive.
+        candidates: list[int] = [settings.camera_index]
+        candidates.extend(index for index in range(4) if index != settings.camera_index)
 
-        ok, _ = capture.read()
-        if not ok:
-            capture.release()
-            raise RuntimeError(
-                f"[FATAL] Camera index {settings.camera_index} opened but did not return frames. "
-                "Close other apps using the BRIO and try again."
+        failures: list[str] = []
+        for index in candidates:
+            logger.info("[CAMERA] Trying %s at index %s", settings.camera_label, index)
+            capture = cv2.VideoCapture(index, backend)
+            if not capture.isOpened():
+                capture.release()
+                failures.append(f"index {index}: could not be opened")
+                continue
+
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, settings.frame_width)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, settings.frame_height)
+            capture.set(cv2.CAP_PROP_FPS, settings.target_fps)
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            ok, _ = capture.read()
+            if not ok:
+                capture.release()
+                failures.append(f"index {index}: opened but returned no frames")
+                continue
+
+            if index != settings.camera_index:
+                logger.warning(
+                    "[CAMERA] Configured index %s did not work; using index %s instead. "
+                    "Set CAMERA_INDEX=%s in backend/.env if this is the wrong camera.",
+                    settings.camera_index,
+                    index,
+                    index,
+                )
+            logger.info("[CAMERA] Locked %s at index %s", settings.camera_label, index)
+            return capture
+
+        detail = "; ".join(failures) or "no camera indexes to try"
+        hint = "Close other apps using the BRIO and try again."
+        if sys.platform == "darwin":
+            hint = (
+                "On macOS, grant Camera access to the app running this server "
+                "(System Settings > Privacy & Security > Camera), then restart it."
             )
-        return capture
+        raise RuntimeError(f"[FATAL] {settings.camera_label} is unavailable ({detail}). {hint}")
 
     def _read_latest_frame(self):
         with self.frame_lock:
@@ -576,6 +704,18 @@ def health():
     return jsonify({"ok": True, **runtime.health_payload()})
 
 
+@app.post("/session/restart")
+def restart_session():
+    payload = runtime.start_or_restart_session()
+    return jsonify({"ok": True, "payload": payload, "health": runtime.health_payload()})
+
+
+@app.post("/session/stop")
+def stop_session():
+    payload = runtime.stop_session()
+    return jsonify({"ok": True, "payload": payload, "health": runtime.health_payload()})
+
+
 @app.route("/artifacts/audio/<path:filename>")
 def audio_artifact(filename: str):
     audio_dir = settings.backend_root / "artifacts" / "audio"
@@ -593,6 +733,14 @@ def on_connect():
 def on_activate():
     logger.info("[Socket] activate_surgeai received")
     payload = runtime.start_or_restart_session()
+    emit("frame_state", {"payload": payload})
+    emit("system_health", {"payload": runtime.health_payload()})
+
+
+@socketio.on("deactivate_surgeai", namespace=settings.namespace)
+def on_deactivate():
+    logger.info("[Socket] deactivate_surgeai received")
+    payload = runtime.stop_session()
     emit("frame_state", {"payload": payload})
     emit("system_health", {"payload": runtime.health_payload()})
 
@@ -652,7 +800,9 @@ if __name__ == "__main__":
     print(f"  Health:    http://localhost:{settings.port}/health")
     print(f"  Socket.IO: http://localhost:{settings.port}{settings.namespace}")
     print(f"  YOLO:      {'Loaded' if runtime.vision.model is not None else 'Not available'}")
-    print(f"  Camera:    {settings.camera_label} locked to index {settings.camera_index}")
+    print(f"  Camera:    {settings.camera_label}, preferred index {settings.camera_index}")
+    if sys.platform == "darwin":
+        print(f"  Detected:  {', '.join(macos_camera_names()) or 'none'}")
     print("=" * 55)
 
     socketio.run(
